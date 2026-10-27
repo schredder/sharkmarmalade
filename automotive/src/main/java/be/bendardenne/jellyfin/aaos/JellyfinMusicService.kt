@@ -12,7 +12,9 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaLibraryService
@@ -30,6 +32,8 @@ import org.jellyfin.sdk.Jellyfin
 import org.jellyfin.sdk.api.client.ApiClient
 import org.jellyfin.sdk.api.client.extensions.playStateApi
 import org.jellyfin.sdk.model.serializer.toUUID
+import java.io.IOException
+import java.util.concurrent.Executors
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -48,6 +52,8 @@ class JellyfinMusicService : MediaLibraryService() {
     private lateinit var callback: JellyfinMediaLibrarySessionCallback
 
     private val handler: Handler = Handler(Looper.getMainLooper())
+    private val cacheExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var currentTrackCacheWriter: CacheWriter? = null
     private var currentPlaybackTime: Long = 0;
     private var currentTrack: MediaItem? = null;
 
@@ -63,6 +69,7 @@ class JellyfinMusicService : MediaLibraryService() {
                     putInt(PLAYLIST_INDEX_PREF, player.currentMediaItemIndex)
                 }
 
+                cacheCurrentTrack(player.currentMediaItem)
                 SuspendToFutureAdapter.launchFuture { reportPlayback(player) }
             }
         }
@@ -78,7 +85,7 @@ class JellyfinMusicService : MediaLibraryService() {
 
         val cacheDir = cacheDir
         val databaseProvider = StandaloneDatabaseProvider(this)
-        cache = SimpleCache(cacheDir, LeastRecentlyUsedCacheEvictor(500 * 1024 * 1024), databaseProvider)
+        cache = SimpleCache(cacheDir, LeastRecentlyUsedCacheEvictor(1024L * 1024 * 1024), databaseProvider)
 
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
         cacheDataSourceFactory = CacheDataSource.Factory()
@@ -139,6 +146,8 @@ class JellyfinMusicService : MediaLibraryService() {
     override fun onDestroy() {
         Log.i(LOG_MARKER, "onDestroy")
 
+        cancelCurrentTrackCache()
+        cacheExecutor.shutdownNow()
         mediaLibrarySession.release()
         mediaLibrarySession.player.removeListener(playerListener)
         mediaLibrarySession.player.release()
@@ -169,15 +178,49 @@ class JellyfinMusicService : MediaLibraryService() {
 
         val authedHttpFactory = DefaultHttpDataSource.Factory()
             .setDefaultRequestProperties(headers)
-        val authedCacheFactory = CacheDataSource.Factory()
+        cacheDataSourceFactory = CacheDataSource.Factory()
             .setCache(cache)
             .setUpstreamDataSourceFactory(authedHttpFactory)
             .setCacheKeyFactory { dataSpec -> dataSpec.uri.toString() }
 
-        mediaSourceFactory.setDataSourceFactory(authedCacheFactory)
+        mediaSourceFactory.setDataSourceFactory(cacheDataSourceFactory)
 
         // Trigger a refresh upon login.
         mediaLibrarySession.notifyChildrenChanged(ROOT_ID, 4, null)
+    }
+
+    private fun cacheCurrentTrack(mediaItem: MediaItem?) {
+        cancelCurrentTrackCache()
+
+        val uri = mediaItem?.localConfiguration?.uri ?: return
+        val writer = CacheWriter(
+            cacheDataSourceFactory.createDataSource(),
+            DataSpec.Builder().setUri(uri).build(),
+            null,
+            null
+        )
+        currentTrackCacheWriter = writer
+
+        cacheExecutor.execute {
+            try {
+                writer.cache()
+                Log.i(LOG_MARKER, "Finished caching current track: $uri")
+            } catch (e: IOException) {
+                Log.w(LOG_MARKER, "Unable to cache current track: $uri", e)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                Log.d(LOG_MARKER, "Caching current track was cancelled: $uri")
+            } finally {
+                if (currentTrackCacheWriter === writer) {
+                    currentTrackCacheWriter = null
+                }
+            }
+        }
+    }
+
+    private fun cancelCurrentTrackCache() {
+        currentTrackCacheWriter?.cancel()
+        currentTrackCacheWriter = null
     }
 
     private suspend fun reportPlayback(player: Player) {
