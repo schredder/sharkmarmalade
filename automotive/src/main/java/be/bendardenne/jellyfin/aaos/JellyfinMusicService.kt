@@ -14,14 +14,14 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
-import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
-import androidx.media3.datasource.cache.SimpleCache
 import androidx.preference.PreferenceManager
 import be.bendardenne.jellyfin.aaos.JellyfinMediaLibrarySessionCallback.Companion.PLAYLIST_INDEX_PREF
 import be.bendardenne.jellyfin.aaos.JellyfinMediaLibrarySessionCallback.Companion.PLAYLIST_TRACK_POSITON_MS_PREF
@@ -34,7 +34,11 @@ import org.jellyfin.sdk.api.client.extensions.playStateApi
 import org.jellyfin.sdk.model.serializer.toUUID
 import java.io.IOException
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import javax.inject.Inject
+
+// Cache the current song plus up to two upcoming songs.
+private const val CACHE_QUEUE_WINDOW_SIZE = 3
 
 @AndroidEntryPoint
 @OptIn(UnstableApi::class)
@@ -53,7 +57,8 @@ class JellyfinMusicService : MediaLibraryService() {
 
     private val handler: Handler = Handler(Looper.getMainLooper())
     private val cacheExecutor = Executors.newSingleThreadExecutor()
-    @Volatile private var currentTrackCacheWriter: CacheWriter? = null
+    @Volatile private var activeCacheWriter: CacheWriter? = null
+    private var cacheWindowFuture: Future<*>? = null
     private var currentPlaybackTime: Long = 0;
     private var currentTrack: MediaItem? = null;
 
@@ -62,6 +67,14 @@ class JellyfinMusicService : MediaLibraryService() {
 
     private val playerListener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
+            if (events.contains(Player.EVENT_TIMELINE_CHANGED) ||
+                events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION) ||
+                events.contains(Player.EVENT_SHUFFLE_MODE_ENABLED_CHANGED) ||
+                events.contains(Player.EVENT_REPEAT_MODE_CHANGED)
+            ) {
+                cacheQueueWindow(player)
+            }
+
             if (events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION)) {
                 // Persist the current index of the queue in the preferences.
                 // This is restored in onPlaybackResumption
@@ -69,7 +82,6 @@ class JellyfinMusicService : MediaLibraryService() {
                     putInt(PLAYLIST_INDEX_PREF, player.currentMediaItemIndex)
                 }
 
-                cacheCurrentTrack(player.currentMediaItem)
                 SuspendToFutureAdapter.launchFuture { reportPlayback(player) }
             }
         }
@@ -146,11 +158,12 @@ class JellyfinMusicService : MediaLibraryService() {
     override fun onDestroy() {
         Log.i(LOG_MARKER, "onDestroy")
 
-        cancelCurrentTrackCache()
+        val player = mediaLibrarySession.player
+        player.removeListener(playerListener)
+        cancelQueueCaching()
         cacheExecutor.shutdownNow()
         mediaLibrarySession.release()
-        mediaLibrarySession.player.removeListener(playerListener)
-        mediaLibrarySession.player.release()
+        player.release()
         handler.removeCallbacks(playbackPoll)
         super.onDestroy()
     }
@@ -189,38 +202,75 @@ class JellyfinMusicService : MediaLibraryService() {
         mediaLibrarySession.notifyChildrenChanged(ROOT_ID, 4, null)
     }
 
-    private fun cacheCurrentTrack(mediaItem: MediaItem?) {
-        cancelCurrentTrackCache()
+    private fun cacheQueueWindow(player: Player) {
+        cancelQueueCaching()
 
-        val uri = mediaItem?.localConfiguration?.uri ?: return
-        val writer = CacheWriter(
-            cacheDataSourceFactory.createDataSource(),
-            DataSpec.Builder().setUri(uri).build(),
-            null,
-            null
-        )
-        currentTrackCacheWriter = writer
+        val mediaItems = getCacheWindow(player)
+        if (mediaItems.isEmpty()) return
+        val dataSourceFactory = cacheDataSourceFactory
 
-        cacheExecutor.execute {
-            try {
-                writer.cache()
-                Log.i(LOG_MARKER, "Finished caching current track: $uri")
-            } catch (e: IOException) {
-                Log.w(LOG_MARKER, "Unable to cache current track: $uri", e)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                Log.d(LOG_MARKER, "Caching current track was cancelled: $uri")
-            } finally {
-                if (currentTrackCacheWriter === writer) {
-                    currentTrackCacheWriter = null
+        cacheWindowFuture = cacheExecutor.submit {
+            for (mediaItem in mediaItems) {
+                if (Thread.currentThread().isInterrupted) break
+
+                val uri = mediaItem.localConfiguration?.uri ?: continue
+                val writer = CacheWriter(
+                    dataSourceFactory.createDataSource(),
+                    DataSpec.Builder().setUri(uri).build(),
+                    null,
+                    null
+                )
+                activeCacheWriter = writer
+
+                try {
+                    if (Thread.currentThread().isInterrupted) {
+                        writer.cancel()
+                        break
+                    }
+                    writer.cache()
+                    Log.i(LOG_MARKER, "Finished caching track ${mediaItem.mediaId}")
+                } catch (e: IOException) {
+                    Log.w(LOG_MARKER, "Unable to cache track ${mediaItem.mediaId}", e)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    Log.d(LOG_MARKER, "Caching track ${mediaItem.mediaId} was cancelled")
+                    break
+                } finally {
+                    if (activeCacheWriter === writer) {
+                        activeCacheWriter = null
+                    }
                 }
             }
         }
     }
 
-    private fun cancelCurrentTrackCache() {
-        currentTrackCacheWriter?.cancel()
-        currentTrackCacheWriter = null
+    private fun getCacheWindow(player: Player): List<MediaItem> {
+        if (player.currentMediaItemIndex !in 0 until player.mediaItemCount) return emptyList()
+
+        val mediaItems = mutableListOf<MediaItem>()
+        val seenUris = mutableSetOf<String>()
+        var itemIndex = player.currentMediaItemIndex
+
+        repeat(CACHE_QUEUE_WINDOW_SIZE) {
+            if (itemIndex !in 0 until player.mediaItemCount) return mediaItems
+
+            val mediaItem = player.getMediaItemAt(itemIndex)
+            val uri = mediaItem.localConfiguration?.uri
+            if (uri != null && seenUris.add(uri.toString())) {
+                mediaItems += mediaItem
+            }
+
+            itemIndex = player.nextMediaItemIndex
+        }
+
+        return mediaItems
+    }
+
+    private fun cancelQueueCaching() {
+        activeCacheWriter?.cancel()
+        activeCacheWriter = null
+        cacheWindowFuture?.cancel(true)
+        cacheWindowFuture = null
     }
 
     private suspend fun reportPlayback(player: Player) {
