@@ -10,13 +10,12 @@ import androidx.core.content.edit
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -47,9 +46,11 @@ class JellyfinMusicService : MediaLibraryService() {
     @Inject
     lateinit var jellyfin: Jellyfin
 
+    @Inject
+    lateinit var cache: SimpleCache
+
     private lateinit var accountManager: JellyfinAccountManager
     private lateinit var jellyfinApi: ApiClient
-    private lateinit var cache: SimpleCache
     private lateinit var cacheDataSourceFactory: CacheDataSource.Factory
     private lateinit var mediaSourceFactory: DefaultMediaSourceFactory
     private lateinit var mediaLibrarySession: MediaLibrarySession
@@ -94,10 +95,6 @@ class JellyfinMusicService : MediaLibraryService() {
 
         accountManager = JellyfinAccountManager(AccountManager.get(applicationContext))
         jellyfinApi = jellyfin.createApi()
-
-        val cacheDir = cacheDir
-        val databaseProvider = StandaloneDatabaseProvider(this)
-        cache = SimpleCache(cacheDir, LeastRecentlyUsedCacheEvictor(1024L * 1024 * 1024), databaseProvider)
 
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
         cacheDataSourceFactory = CacheDataSource.Factory()
@@ -215,7 +212,7 @@ class JellyfinMusicService : MediaLibraryService() {
 
                 val uri = mediaItem.localConfiguration?.uri ?: continue
                 val writer = CacheWriter(
-                    dataSourceFactory.createDataSource(),
+                    dataSourceFactory.createDataSourceForDownloading(),
                     DataSpec.Builder().setUri(uri).build(),
                     null,
                     null
@@ -242,28 +239,6 @@ class JellyfinMusicService : MediaLibraryService() {
                 }
             }
         }
-    }
-
-    private fun getCacheWindow(player: Player): List<MediaItem> {
-        if (player.currentMediaItemIndex !in 0 until player.mediaItemCount) return emptyList()
-
-        val mediaItems = mutableListOf<MediaItem>()
-        val seenUris = mutableSetOf<String>()
-        var itemIndex = player.currentMediaItemIndex
-
-        repeat(CACHE_QUEUE_WINDOW_SIZE) {
-            if (itemIndex !in 0 until player.mediaItemCount) return mediaItems
-
-            val mediaItem = player.getMediaItemAt(itemIndex)
-            val uri = mediaItem.localConfiguration?.uri
-            if (uri != null && seenUris.add(uri.toString())) {
-                mediaItems += mediaItem
-            }
-
-            itemIndex = player.nextMediaItemIndex
-        }
-
-        return mediaItems
     }
 
     private fun cancelQueueCaching() {
@@ -298,4 +273,36 @@ class JellyfinMusicService : MediaLibraryService() {
             )
         }
     }
+}
+
+@OptIn(UnstableApi::class)
+internal fun getCacheWindow(player: Player): List<MediaItem> {
+    val timeline = player.currentTimeline
+    val currentIndex = player.currentMediaItemIndex
+    if (timeline.isEmpty || currentIndex !in 0 until timeline.windowCount) return emptyList()
+
+    val repeatMode = if (player.repeatMode == Player.REPEAT_MODE_ONE) {
+        Player.REPEAT_MODE_OFF
+    } else {
+        player.repeatMode
+    }
+    val shuffleModeEnabled = player.shuffleModeEnabled
+    val window = Timeline.Window()
+    val mediaItems = mutableListOf<MediaItem>()
+    val seenUris = mutableSetOf<String>()
+    var itemIndex = currentIndex
+
+    repeat(CACHE_QUEUE_WINDOW_SIZE) {
+        if (itemIndex !in 0 until timeline.windowCount) return mediaItems
+
+        val mediaItem = timeline.getWindow(itemIndex, window).mediaItem
+        val uri = mediaItem.localConfiguration?.uri
+        if (uri != null && seenUris.add(uri.toString())) {
+            mediaItems += mediaItem
+        }
+
+        itemIndex = timeline.getNextWindowIndex(itemIndex, repeatMode, shuffleModeEnabled)
+    }
+
+    return mediaItems
 }
