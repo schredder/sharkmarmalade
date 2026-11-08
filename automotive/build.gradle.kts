@@ -14,7 +14,7 @@ android {
         applicationId = "be.bendardenne.jellyfin.aaos"
         minSdk = 29
         targetSdk = 36
-        versionCode = 47
+        versionCode = 49
         versionName = "1.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -27,7 +27,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            optimization {
+                enable = true
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

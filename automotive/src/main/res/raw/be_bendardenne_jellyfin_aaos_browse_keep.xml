@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AAOS loads these browse icons by android.resource URI; no R.drawable references exist. -->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/casino,@drawable/schedule,@drawable/star_filled,@drawable/playlists" />
