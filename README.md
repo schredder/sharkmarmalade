@@ -21,7 +21,7 @@ This is not even a hobby project, this is something I needed, so I made it.
 I published it on the play store because I had to (yes, you need to ask permission and pay a $25 fee to install your own software in your own car...).
 I made it public because I figured other people might find it useful, and as a way of contributing back to the Jellyfin ecosystem which I've used for years.
 
-In general, I don't intend to spend a lot of time maintaining the app or developping features that I don't need myself.
+In general, I don't intend to spend a lot of time maintaining the app beyond keeping it working, or developping features that I don't need myself.
 
 That being said, if you would like to improve Shark Marmalade, PRs are more than welcome and I will happily help you if needed. 
 I have no problem with AI-based contributions, as long as they are human-reviewable and maintainable.
