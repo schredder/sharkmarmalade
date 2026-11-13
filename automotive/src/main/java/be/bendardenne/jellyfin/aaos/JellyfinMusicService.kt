@@ -23,6 +23,7 @@ import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.ExtractorsFactory
 import androidx.media3.extractor.mp3.Mp3Extractor
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
@@ -30,7 +31,9 @@ import androidx.preference.PreferenceManager
 import be.bendardenne.jellyfin.aaos.JellyfinMediaLibrarySessionCallback.Companion.PLAYLIST_INDEX_PREF
 import be.bendardenne.jellyfin.aaos.JellyfinMediaLibrarySessionCallback.Companion.PLAYLIST_TRACK_POSITON_MS_PREF
 import be.bendardenne.jellyfin.aaos.MediaItemFactory.Companion.ROOT_ID
+import be.bendardenne.jellyfin.aaos.SharkMarmaladeConstants.DIRECT_STREAM
 import be.bendardenne.jellyfin.aaos.SharkMarmaladeConstants.LOG_MARKER
+import be.bendardenne.jellyfin.aaos.SharkMarmaladeConstants.PREF_BITRATE
 import dagger.hilt.android.AndroidEntryPoint
 import org.jellyfin.sdk.Jellyfin
 import org.jellyfin.sdk.api.client.ApiClient
@@ -110,8 +113,34 @@ class JellyfinMusicService : MediaLibraryService() {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
         cacheDataSourceFactory = createCacheDataSourceFactory(httpDataSourceFactory)
 
-        val extractorsFactory = DefaultExtractorsFactory()
-            .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS)
+        val defaultExtractorsFactory = DefaultExtractorsFactory()
+        val extractorsFactory = object : ExtractorsFactory {
+            private fun updateFlags() {
+                val preferenceBitrate = PreferenceManager
+                    .getDefaultSharedPreferences(this@JellyfinMusicService)
+                    .getString(PREF_BITRATE, DIRECT_STREAM)
+                val isTranscodingEnabled = preferenceBitrate != DIRECT_STREAM
+                val flags = if (isTranscodingEnabled) {
+                    Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS
+                } else {
+                    0 // default behavior. there is no constant for this
+                }
+                defaultExtractorsFactory.setMp3ExtractorFlags(flags)
+            }
+
+            override fun createExtractors(): Array<androidx.media3.extractor.Extractor> {
+                updateFlags()
+                return defaultExtractorsFactory.createExtractors()
+            }
+
+            override fun createExtractors(
+                uri: android.net.Uri,
+                responseHeaders: Map<String, List<String>>
+            ): Array<androidx.media3.extractor.Extractor> {
+                updateFlags()
+                return defaultExtractorsFactory.createExtractors(uri, responseHeaders)
+            }
+        }
 
         mediaSourceFactory = DefaultMediaSourceFactory(this, extractorsFactory)
             .setDataSourceFactory(cacheDataSourceFactory)
