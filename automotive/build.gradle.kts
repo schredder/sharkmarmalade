@@ -14,7 +14,7 @@ android {
         applicationId = "be.bendardenne.jellyfin.aaos"
         minSdk = 29
         targetSdk = 36
-        versionCode = 49
+        versionCode = 50
         versionName = "1.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
