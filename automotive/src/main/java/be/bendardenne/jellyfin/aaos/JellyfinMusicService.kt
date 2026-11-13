@@ -8,17 +8,22 @@ import androidx.annotation.OptIn
 import androidx.concurrent.futures.SuspendToFutureAdapter
 import androidx.core.content.edit
 import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.ContentMetadata
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.mp3.Mp3Extractor
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.preference.PreferenceManager
@@ -36,8 +41,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import javax.inject.Inject
 
-// Cache the current song plus up to two upcoming songs.
-private const val CACHE_QUEUE_WINDOW_SIZE = 3
+// Cache up to two upcoming songs.
+private const val CACHE_QUEUE_WINDOW_SIZE = 2
+private const val MIN_BUFFER_FOR_PREFETCH_MS = 15_000L
 
 @AndroidEntryPoint
 @OptIn(UnstableApi::class)
@@ -59,6 +65,9 @@ class JellyfinMusicService : MediaLibraryService() {
     private val handler: Handler = Handler(Looper.getMainLooper())
     private val cacheExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var activeCacheWriter: CacheWriter? = null
+    private val activeCacheKeys = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    )
     private var cacheWindowFuture: Future<*>? = null
     private var currentPlaybackTime: Long = 0;
     private var currentTrack: MediaItem? = null;
@@ -71,7 +80,9 @@ class JellyfinMusicService : MediaLibraryService() {
             if (events.contains(Player.EVENT_TIMELINE_CHANGED) ||
                 events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION) ||
                 events.contains(Player.EVENT_SHUFFLE_MODE_ENABLED_CHANGED) ||
-                events.contains(Player.EVENT_REPEAT_MODE_CHANGED)
+                events.contains(Player.EVENT_REPEAT_MODE_CHANGED) ||
+                events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED) ||
+                events.contains(Player.EVENT_IS_LOADING_CHANGED)
             ) {
                 cacheQueueWindow(player)
             }
@@ -97,12 +108,12 @@ class JellyfinMusicService : MediaLibraryService() {
         jellyfinApi = jellyfin.createApi()
 
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
-        cacheDataSourceFactory = CacheDataSource.Factory()
-            .setCache(cache)
-            .setUpstreamDataSourceFactory(httpDataSourceFactory)
-            .setCacheKeyFactory { dataSpec -> dataSpec.uri.toString() }
+        cacheDataSourceFactory = createCacheDataSourceFactory(httpDataSourceFactory)
 
-        mediaSourceFactory = DefaultMediaSourceFactory(this)
+        val extractorsFactory = DefaultExtractorsFactory()
+            .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING_ALWAYS)
+
+        mediaSourceFactory = DefaultMediaSourceFactory(this, extractorsFactory)
             .setDataSourceFactory(cacheDataSourceFactory)
 
         val player = ExoPlayer.Builder(this)
@@ -128,6 +139,67 @@ class JellyfinMusicService : MediaLibraryService() {
         if (accountManager.isAuthenticated) {
             onLogin()
         }
+    }
+
+    private fun extractTrackId(uriString: String?): String? {
+        if (uriString == null) return null
+        val uri = android.net.Uri.parse(uriString)
+        val segments = uri.pathSegments ?: return null
+        val audioIndex = segments.indexOfFirst { it.equals("Audio", ignoreCase = true) }
+        if (audioIndex != -1 && audioIndex + 1 < segments.size) {
+            return segments[audioIndex + 1]
+        }
+        val itemsIndex = segments.indexOfFirst { it.equals("Items", ignoreCase = true) }
+        if (itemsIndex != -1 && itemsIndex + 1 < segments.size) {
+            return segments[itemsIndex + 1]
+        }
+        return null
+    }
+
+    private fun getCacheKey(dataSpec: DataSpec): String {
+        if (!dataSpec.key.isNullOrEmpty()) {
+            return dataSpec.key!!
+        }
+        val extracted = extractTrackId(dataSpec.uri.toString())
+        val cacheKey = extracted ?: dataSpec.uri.toString()
+        Log.d(LOG_MARKER, "getCacheKey(dataSpec) returning key $cacheKey")
+        return cacheKey
+    }
+
+    private fun getCacheKey(mediaItem: MediaItem?): String? {
+        if (mediaItem == null) return null
+        val customKey = mediaItem.localConfiguration?.customCacheKey
+        if (!customKey.isNullOrEmpty()) return customKey
+        val mediaId = mediaItem.mediaId
+        if (mediaId.isNotEmpty() && mediaId != ROOT_ID) {
+            return mediaId
+        }
+        val uriStr = mediaItem.localConfiguration?.uri?.toString()
+        val cacheKey = extractTrackId(uriStr) ?: uriStr
+        Log.d(LOG_MARKER, "getCacheKey(mediaItem) returning key $cacheKey")
+        return cacheKey
+
+    }
+
+    private fun createCacheDataSourceFactory(httpFactory: DefaultHttpDataSource.Factory): CacheDataSource.Factory {
+        val cacheDataSinkFactory = CacheDataSink.Factory()
+            .setCache(cache)
+            .setFragmentSize(2 * 1024 * 1024)
+
+        return CacheDataSource.Factory()
+            .setCache(cache)
+            .setUpstreamDataSourceFactory(httpFactory)
+            .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
+            .setCacheKeyFactory { dataSpec -> getCacheKey(dataSpec) }
+            .setEventListener(object : CacheDataSource.EventListener {
+                override fun onCachedBytesRead(cacheSizeBytes: Long, cachedBytesRead: Long) {
+                    Log.d(LOG_MARKER, "CacheDataSource.onCachedBytesRead: cacheSizeBytes=$cacheSizeBytes, cachedBytesRead=$cachedBytesRead")
+                }
+
+                override fun onCacheIgnored(reason: Int) {
+                    Log.w(LOG_MARKER, "CacheDataSource.onCacheIgnored: reason=$reason")
+                }
+            })
     }
 
     private fun pollForPlaybackStatus(player: ExoPlayer) {
@@ -188,10 +260,7 @@ class JellyfinMusicService : MediaLibraryService() {
 
         val authedHttpFactory = DefaultHttpDataSource.Factory()
             .setDefaultRequestProperties(headers)
-        cacheDataSourceFactory = CacheDataSource.Factory()
-            .setCache(cache)
-            .setUpstreamDataSourceFactory(authedHttpFactory)
-            .setCacheKeyFactory { dataSpec -> dataSpec.uri.toString() }
+        cacheDataSourceFactory = createCacheDataSourceFactory(authedHttpFactory)
 
         mediaSourceFactory.setDataSourceFactory(cacheDataSourceFactory)
 
@@ -202,18 +271,47 @@ class JellyfinMusicService : MediaLibraryService() {
     private fun cacheQueueWindow(player: Player) {
         cancelQueueCaching()
 
-        val mediaItems = getCacheWindow(player)
-        if (mediaItems.isEmpty()) return
+        // Do not pre-fetch if ExoPlayer is buffering or idle
+        if (player.playbackState == Player.STATE_BUFFERING || player.playbackState == Player.STATE_IDLE) {
+            return
+        }
+
+        val bufferMs = player.bufferedPosition - player.currentPosition
+        val isFullyBuffered = player.duration > 0 && (player.bufferedPosition >= player.duration || player.playbackState == Player.STATE_ENDED)
+
+        if (!isFullyBuffered && bufferMs < MIN_BUFFER_FOR_PREFETCH_MS) {
+            // Active track playback buffer is not yet healthy enough to share network bandwidth
+            return
+        }
+
+        val upcomingItems = getCacheWindow(player)
+        if (upcomingItems.isEmpty()) return
         val dataSourceFactory = cacheDataSourceFactory
 
         cacheWindowFuture = cacheExecutor.submit {
-            for (mediaItem in mediaItems) {
+            for (mediaItem in upcomingItems) {
                 if (Thread.currentThread().isInterrupted) break
 
                 val uri = mediaItem.localConfiguration?.uri ?: continue
+                val cacheKey = getCacheKey(mediaItem) ?: uri.toString()
+
+                val metadata = cache.getContentMetadata(cacheKey)
+                val contentLength = ContentMetadata.getContentLength(metadata)
+                val isFullyCached = contentLength != C.LENGTH_UNSET.toLong() && cache.isCached(cacheKey, 0, contentLength)
+
+                if (isFullyCached) {
+                    Log.d(LOG_MARKER, "Track ${mediaItem.mediaId} is already fully cached, skipping pre-fetch")
+                    continue
+                }
+
+                if (!activeCacheKeys.add(cacheKey)) {
+                    Log.d(LOG_MARKER, "Track ${mediaItem.mediaId} is currently being downloaded, skipping pre-fetch")
+                    continue
+                }
+
                 val writer = CacheWriter(
                     dataSourceFactory.createDataSourceForDownloading(),
-                    DataSpec.Builder().setUri(uri).build(),
+                    DataSpec.Builder().setUri(uri).setKey(cacheKey).build(),
                     null,
                     null
                 )
@@ -224,15 +322,23 @@ class JellyfinMusicService : MediaLibraryService() {
                         writer.cancel()
                         break
                     }
+                    val initialCachedBytes = cache.getCachedBytes(cacheKey, 0, Long.MAX_VALUE)
+                    if (initialCachedBytes > 0) {
+                        Log.i(
+                            LOG_MARKER,
+                            "Resuming download for partially cached track ${mediaItem.mediaId} ($initialCachedBytes bytes already cached)"
+                        )
+                    }
                     writer.cache()
                     Log.i(LOG_MARKER, "Finished caching track ${mediaItem.mediaId}")
                 } catch (e: IOException) {
                     Log.w(LOG_MARKER, "Unable to cache track ${mediaItem.mediaId}", e)
-                } catch (e: InterruptedException) {
+                } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                     Log.d(LOG_MARKER, "Caching track ${mediaItem.mediaId} was cancelled")
                     break
                 } finally {
+                    activeCacheKeys.remove(cacheKey)
                     if (activeCacheWriter === writer) {
                         activeCacheWriter = null
                     }
@@ -244,6 +350,7 @@ class JellyfinMusicService : MediaLibraryService() {
     private fun cancelQueueCaching() {
         activeCacheWriter?.cancel()
         activeCacheWriter = null
+        activeCacheKeys.clear()
         cacheWindowFuture?.cancel(true)
         cacheWindowFuture = null
     }
@@ -290,10 +397,16 @@ internal fun getCacheWindow(player: Player): List<MediaItem> {
     val window = Timeline.Window()
     val mediaItems = mutableListOf<MediaItem>()
     val seenUris = mutableSetOf<String>()
-    var itemIndex = currentIndex
+
+    val currentUri = timeline.getWindow(currentIndex, window).mediaItem.localConfiguration?.uri?.toString()
+    if (currentUri != null) {
+        seenUris.add(currentUri)
+    }
+
+    var itemIndex = timeline.getNextWindowIndex(currentIndex, repeatMode, shuffleModeEnabled)
 
     repeat(CACHE_QUEUE_WINDOW_SIZE) {
-        if (itemIndex !in 0 until timeline.windowCount) return mediaItems
+        if (itemIndex == C.INDEX_UNSET || itemIndex !in 0 until timeline.windowCount) return mediaItems
 
         val mediaItem = timeline.getWindow(itemIndex, window).mediaItem
         val uri = mediaItem.localConfiguration?.uri
