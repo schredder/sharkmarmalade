@@ -273,7 +273,6 @@ class MediaItemFactory(
             .setMediaId(item.id.toString())
             .setMediaMetadata(metadata)
             .setUri(audioStream)
-            .setCustomCacheKey(item.id.toString())
             .build()
     }
 

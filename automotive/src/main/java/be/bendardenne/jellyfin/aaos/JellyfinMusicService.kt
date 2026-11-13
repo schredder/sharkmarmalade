@@ -141,46 +141,6 @@ class JellyfinMusicService : MediaLibraryService() {
         }
     }
 
-    private fun extractTrackId(uriString: String?): String? {
-        if (uriString == null) return null
-        val uri = android.net.Uri.parse(uriString)
-        val segments = uri.pathSegments ?: return null
-        val audioIndex = segments.indexOfFirst { it.equals("Audio", ignoreCase = true) }
-        if (audioIndex != -1 && audioIndex + 1 < segments.size) {
-            return segments[audioIndex + 1]
-        }
-        val itemsIndex = segments.indexOfFirst { it.equals("Items", ignoreCase = true) }
-        if (itemsIndex != -1 && itemsIndex + 1 < segments.size) {
-            return segments[itemsIndex + 1]
-        }
-        return null
-    }
-
-    private fun getCacheKey(dataSpec: DataSpec): String {
-        if (!dataSpec.key.isNullOrEmpty()) {
-            return dataSpec.key!!
-        }
-        val extracted = extractTrackId(dataSpec.uri.toString())
-        val cacheKey = extracted ?: dataSpec.uri.toString()
-        Log.d(LOG_MARKER, "getCacheKey(dataSpec) returning key $cacheKey")
-        return cacheKey
-    }
-
-    private fun getCacheKey(mediaItem: MediaItem?): String? {
-        if (mediaItem == null) return null
-        val customKey = mediaItem.localConfiguration?.customCacheKey
-        if (!customKey.isNullOrEmpty()) return customKey
-        val mediaId = mediaItem.mediaId
-        if (mediaId.isNotEmpty() && mediaId != ROOT_ID) {
-            return mediaId
-        }
-        val uriStr = mediaItem.localConfiguration?.uri?.toString()
-        val cacheKey = extractTrackId(uriStr) ?: uriStr
-        Log.d(LOG_MARKER, "getCacheKey(mediaItem) returning key $cacheKey")
-        return cacheKey
-
-    }
-
     private fun createCacheDataSourceFactory(httpFactory: DefaultHttpDataSource.Factory): CacheDataSource.Factory {
         val cacheDataSinkFactory = CacheDataSink.Factory()
             .setCache(cache)
@@ -190,7 +150,6 @@ class JellyfinMusicService : MediaLibraryService() {
             .setCache(cache)
             .setUpstreamDataSourceFactory(httpFactory)
             .setCacheWriteDataSinkFactory(cacheDataSinkFactory)
-            .setCacheKeyFactory { dataSpec -> getCacheKey(dataSpec) }
             .setEventListener(object : CacheDataSource.EventListener {
                 override fun onCachedBytesRead(cacheSizeBytes: Long, cachedBytesRead: Long) {
                     Log.d(LOG_MARKER, "CacheDataSource.onCachedBytesRead: cacheSizeBytes=$cacheSizeBytes, cachedBytesRead=$cachedBytesRead")
@@ -293,7 +252,7 @@ class JellyfinMusicService : MediaLibraryService() {
                 if (Thread.currentThread().isInterrupted) break
 
                 val uri = mediaItem.localConfiguration?.uri ?: continue
-                val cacheKey = getCacheKey(mediaItem) ?: uri.toString()
+                val cacheKey = uri.toString()
 
                 val metadata = cache.getContentMetadata(cacheKey)
                 val contentLength = ContentMetadata.getContentLength(metadata)
@@ -311,7 +270,7 @@ class JellyfinMusicService : MediaLibraryService() {
 
                 val writer = CacheWriter(
                     dataSourceFactory.createDataSourceForDownloading(),
-                    DataSpec.Builder().setUri(uri).setKey(cacheKey).build(),
+                    DataSpec.Builder().setUri(uri).build(),
                     null,
                     null
                 )
